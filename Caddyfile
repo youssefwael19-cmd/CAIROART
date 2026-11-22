@@ -1,0 +1,16 @@
+# HTTPS is automatic (Let's Encrypt) once DOMAIN resolves to this server.
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Overwrite the forwarded address rather than appending, so the sign-in
+	# throttle sees the real client and cannot be spoofed by a request header.
+	reverse_proxy app:8787 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+}

@@ -1,0 +1,24 @@
+node_modules
+dist
+.productecho/
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/db.json
+data/db.json.imported-*
+data/staff.json
+data/staff.json.imported
+data/sessions.json
+data/sessions.json.imported
+data/share-secret.txt
+data/initial-manager-password.txt
+data/backups
+data/uploads
+.env
+.env.local
+*.log
+.DS_Store
+/freebuff-sites-build/
+
+# QA scratch credentials
+artifacts/.qa-cookie
