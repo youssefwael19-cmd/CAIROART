@@ -88,8 +88,12 @@ app.use("*", async (c, next) => {
   c.header("x-frame-options", "SAMEORIGIN");
 });
 
+/* Catalog photos are public marketing assets: the storefront shows them and
+   WhatsApp has to fetch them by URL to deliver a product picture. */
+const isPublicMedia = (path: string) => /^\/api\/media\/[a-z0-9_-]+\.jpg$/i.test(path);
+
 app.use("/api/*", async (c, next) => {
-  if (PUBLIC_API.has(c.req.path)) return next();
+  if (PUBLIC_API.has(c.req.path) || isPublicMedia(c.req.path)) return next();
   /* A customer confirmation opened with a valid signed token skips the session;
      the print handler verifies the token itself. */
   const sharedPrint = /^\/api\/orders\/[^/]+\/print$/.test(c.req.path) && Boolean(c.req.query("token"));
@@ -422,7 +426,12 @@ app.post("/api/inbox/message", async (c) => {
   if (result.reply) conv.messages.push(result.reply);
   conv.lastAt = nowIso();
   if (WHATSAPP_TOKEN && WHATSAPP_PHONE_ID && conv.channel === "whatsapp" && result.reply) {
-    void sendWhatsApp(conv.phone, result.reply.text);
+    const origin = new URL(c.req.url).origin;
+    void sendWhatsApp(
+      conv.phone,
+      result.reply.text,
+      result.reply.imageUrl ? `${origin}${result.reply.imageUrl}` : null,
+    );
   }
   /* Both languages are always written: the feed is read in either language, and
      an empty string shows as a blank row. */
@@ -830,12 +839,15 @@ app.post("/api/whatsapp/webhook", async (c) => {
   conv.order = result.order;
   if (result.reply) conv.messages.push(result.reply);
   conv.lastAt = nowIso();
-  if (result.reply) void sendWhatsApp(phone, result.reply.text);
+  if (result.reply) {
+    const origin = new URL(c.req.url).origin;
+    void sendWhatsApp(phone, result.reply.text, result.reply.imageUrl ? `${origin}${result.reply.imageUrl}` : null);
+  }
   commit();
   return c.json({ ok: true });
 });
 
-async function sendWhatsApp(to: string, text: string): Promise<boolean> {
+async function sendWhatsApp(to: string, text: string, imageUrl?: string | null): Promise<boolean> {
   if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) return false;
   try {
     const res = await fetch(`https://graph.facebook.com/v20.0/${WHATSAPP_PHONE_ID}/messages`, {
@@ -844,8 +856,10 @@ async function sendWhatsApp(to: string, text: string): Promise<boolean> {
       body: JSON.stringify({
         messaging_product: "whatsapp",
         to: to.replace(/\D/g, ""),
-        type: "text",
-        text: { body: text },
+        /* A product photo ships as an image message with the reply as caption. */
+        ...(imageUrl
+          ? { type: "image", image: { link: imageUrl, caption: text.slice(0, 900) } }
+          : { type: "text", text: { body: text } }),
       }),
     });
     if (!res.ok) console.error("whatsapp send failed", res.status, await res.text().catch(() => ""));

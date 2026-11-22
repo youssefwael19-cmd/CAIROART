@@ -54,6 +54,9 @@ export interface Message {
   at: string;
   lang: "en" | "ar";
   agent?: string;
+  /* A catalog photo the desk sent with the message. */
+  imageUrl?: string;
+  imageName?: string;
 }
 
 export interface OrderSlotState {
@@ -70,6 +73,8 @@ export interface OrderState {
   skipped: string[];
   turns: number;
   paused: boolean;
+  /* The customer pushed back on the catalog price — only then is budget asked. */
+  priceObjection?: boolean;
 }
 
 export interface Conversation {

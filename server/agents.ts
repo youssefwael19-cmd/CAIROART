@@ -1,4 +1,4 @@
-import type { Conversation, Message, OrderState, OrderSlotState, Qualification } from "../src/types";
+import type { Conversation, Message, OrderState, OrderSlotState, Product, Qualification } from "../src/types";
 import {
   CATEGORY_LABELS,
   CITY_LABELS,
@@ -202,7 +202,13 @@ const SLOTS: SlotDef[] = [
     questionAr: "والميزانية — للقطعة ولا للطلب كله — عشان المختص يسعّر صح؟",
     extract: (text) => {
       const n = extractBudget(text);
-      return n === null ? null : String(n);
+      if (n !== null) return String(n);
+      /* "my budget is 3000" — a plain number tied to the budget word counts. */
+      const t = normaliseDigits(text).toLowerCase().replace(/,/g, "");
+      const m =
+        t.match(/(?:budget|ميزانيه|ميزانية|ميزانيتي|ميزانيتى)[^\d]{0,24}(\d{3,7})/) ??
+        t.match(/(\d{3,7})[^\d]{0,16}(?:budget|ميزانيه|ميزانية|ميزانيتي)/);
+      return m ? m[1] : null;
     },
   },
   {
@@ -277,7 +283,17 @@ export function deriveOrder(conv: Conversation): OrderState {
     };
   }
 
-  const missing = SLOTS.filter((s) => !slots[s.key].value && slots[s.key].asked < maxAsks(s)).map((s) => s.key);
+  /* Budget is not a standing question any more: it is only raised once the
+     customer pushes back on the catalog price. Asking it earlier makes the
+     desk haggle before it has even quoted. */
+  const priceObjection = hasPriceObjection(text);
+  let missing = SLOTS.filter(
+    (s) => !slots[s.key].value && slots[s.key].asked < maxAsks(s) && (s.key !== "budget" || priceObjection),
+  ).map((s) => s.key);
+  /* An objection jumps the queue: settle the price before anything else. */
+  if (priceObjection && missing.includes("budget")) {
+    missing = ["budget", ...missing.filter((k) => k !== "budget")];
+  }
   const skipped = SLOTS.filter((s) => !slots[s.key].value && slots[s.key].asked >= maxAsks(s)).map((s) => s.key);
   const next = missing[0];
 
@@ -288,6 +304,7 @@ export function deriveOrder(conv: Conversation): OrderState {
     skipped,
     turns: previous?.turns ?? 0,
     paused: conv.status === "with-employee" || Boolean(conv.assignedTo),
+    priceObjection,
   };
 }
 
@@ -301,6 +318,54 @@ function confirmDecision(lastMessage: string, timesAsked: number): string | null
 
 const wantsHuman = (text: string) =>
   /(talk to (a )?(human|person|someone|agent)|speak to (a )?(human|someone)|real person|مندوب|موظف حقيقي|اتكلم مع حد|أكلم حد|اكلم حد)/.test(norm(text));
+
+/* The customer saying the catalog price is too much, or refusing to pay it.
+   Only this opens the budget question. */
+const PRICE_OBJECTION =
+  /(too (expensive|much|pricey|high)|expensive|pricey|over ?priced|can ?t afford|cannot afford|cheaper|discount|lower the price|reduce the price|less than that|out of my budget|غالي|غاليه|غالية|غلى|كتير عليا|كتير عليه|مش هقدر|مش قادر|مش قادرة|مش معايا|خصم|تخفيض|قلل السعر|نزل السعر|ارخص|أرخص)/;
+
+export const hasPriceObjection = (text: string) => PRICE_OBJECTION.test(norm(text));
+
+/* ------------------------------------------------------------------ */
+/* Catalog lookup — the item is read before anything is said about it  */
+/* ------------------------------------------------------------------ */
+
+const WORD_SPLIT = /[^\p{L}\p{N}]+/u;
+
+/* Ranks published products against everything the customer has said, so the
+   reply can quote the real name, price, stock and description instead of a
+   generic line. Strongest matches first. */
+export function matchCatalog(conv: Conversation): Product[] {
+  let products: Product[] = [];
+  try {
+    products = getDb().products.filter((p) => p.status === "published");
+  } catch {
+    return [];
+  }
+  const text = norm(customerText(conv));
+  const scored = products
+    .map((product) => {
+      const hints = [
+        product.sku,
+        product.nameEn,
+        product.nameAr,
+        CATEGORY_LABELS[product.category]?.en ?? "",
+        CATEGORY_LABELS[product.category]?.ar ?? "",
+        product.material === "glass" ? "hand blown glass" : "mother of pearl",
+      ];
+      let score = 0;
+      for (const hint of hints) {
+        const h = norm(hint).trim();
+        if (h.length < 3) continue;
+        if (text.includes(h)) score += Math.min(h.length, 24);
+        else for (const word of h.split(WORD_SPLIT)) if (word.length >= 4 && text.includes(word)) score += 2;
+      }
+      return { product, score };
+    })
+    .filter((row) => row.score >= 4)
+    .sort((a, b) => b.score - a.score);
+  return scored.slice(0, 3).map((row) => row.product);
+}
 
 function ack(conv: Conversation, filled: SlotKey[], order: OrderState): string {
   if (filled.length === 0) return "";
@@ -336,7 +401,10 @@ const REPLY_SYSTEM = `You are the Cairo Art sales assistant on WhatsApp. Cairo A
 Rules:
 - Reply in the conversation language: Egyptian Arabic when the payload language says so, otherwise English.
 - Answer the customer's actual last message first — every question, objection, greeting or comment, including ones that are not on the order sheet. Never ignore what they said, never repeat a question they have already answered, and never answer with a scripted-sounding line.
-- Use only the facts in the payload (order sheet, catalog, facts). Never invent or estimate a price, discount, stock level, delivery date, lead time or policy. If the answer is not in the facts, say a specialist will confirm it.
+- Catalog first: when the customer names or describes a piece, look it up in catalogMatches and answer with that item's exact name, price, stock and description from there. If several match, go with the closest one. If nothing matches, say a specialist will confirm the piece rather than describing something you cannot see in the catalog.
+- Never raise the budget yourself. Ask about a budget only when priceObjection is true — the customer called the catalog price too high or refused to pay it. In that case acknowledge it, say the catalog price is the workshop price and a specialist can review the options, then ask the budget question. If priceObjection is false, do not mention budget, discounts or haggling at all.
+- If attachingPhoto is present, say in one short clause that you are sending its photo (it goes out automatically with this message). Never offer or promise a photo you were not given.
+- Use only the facts in the payload (order sheet, catalogMatches, otherPublishedItems, facts). Never invent or estimate a price, discount, stock level, delivery date, lead time or policy. If the answer is not in the facts, say a specialist will confirm it.
 - Then ask exactly one question: the one in mustAskThisOneQuestion, reworded to fit naturally. If the customer's message already answers it, do not ask it again — ask the next best question from stillMissing.
 - If recapBeforeAsking is present, open with a short recap of the order sheet, then the confirmation question.
 - 2 to 4 short sentences, plain WhatsApp text. No bullet lists, no markdown, no headings, no emojis unless the customer used them.`;
@@ -350,18 +418,31 @@ async function composeReply(
   slot: SlotDef,
   question: string,
   scripted: string,
+  matches: Product[],
+  photo: Product | null,
 ): Promise<string | null> {
   if (aiMode !== "llm") return null;
   const ar = conv.lang === "ar";
 
-  let catalog: string[] = [];
+  /* Matched pieces carry their own price, stock, description and photo flag;
+     the rest of the catalog rides along only so the model knows what exists. */
+  const catalogMatches = matches.map((p) => ({
+    name: `${p.nameEn} / ${p.nameAr}`,
+    sku: p.sku,
+    priceEgp: Number(p.priceEgp),
+    stock: p.stock,
+    material: p.material === "glass" ? "hand-blown glass" : "mother-of-pearl",
+    description: ar ? p.descriptionAr : p.descriptionEn,
+    photoOnFile: Boolean(p.imageUrl),
+  }));
+  let otherCatalog: string[] = [];
   try {
-    catalog = getDb()
-      .products.filter((p) => p.status === "published")
-      .slice(0, 10)
-      .map((p) => `${p.nameEn} / ${p.nameAr} (${p.sku}) — ${Number(p.priceEgp).toLocaleString("en-US")} EGP, ${p.stock} in stock`);
+    otherCatalog = getDb()
+      .products.filter((p) => p.status === "published" && !matches.some((m) => m.id === p.id))
+      .slice(0, 6)
+      .map((p) => `${p.nameEn} / ${p.nameAr} — ${Number(p.priceEgp).toLocaleString("en-US")} EGP`);
   } catch {
-    catalog = [];
+    otherCatalog = [];
   }
 
   const history = conv.messages
@@ -379,10 +460,13 @@ async function composeReply(
     orderSheet: sheet,
     stillMissing: order.missing.map((k) => slotLabel(k, conv.lang)),
     mustAskThisOneQuestion: question,
-    catalog,
+    catalogMatches,
+    otherPublishedItems: otherCatalog,
+    priceObjection: Boolean(order.priceObjection),
     facts: STANDING_FACTS,
     scriptedReplyToImprove: scripted,
   };
+  if (photo) payload.attachingPhoto = ar ? photo.nameAr : photo.nameEn;
   if (slot.key === "confirm") {
     payload.recapBeforeAsking = sheet.join("\n");
     payload.notYetConfirmed = order.skipped.map((k) => slotLabel(k, conv.lang));
@@ -486,14 +570,39 @@ export async function handleCustomerMessage(
         : `\n\nNot yet confirmed: ${order.skipped.map((k) => SLOTS.find((s) => s.key === k)?.labelEn ?? k).join(", ")}.`
       : "";
 
+  /* Read the catalog before saying anything: the matched piece is quoted and its
+     own photo is sent along with the reply. */
+  const matches = matchCatalog(conv);
+  const photo = matches.find((p) => p.imageUrl && !conv.messages.some((m) => m.imageUrl === p.imageUrl)) ?? null;
+
+  const quote =
+    matches[0] && nextKey !== "product"
+      ? ar
+        ? `${matches[0].nameAr} سعره ${arNumber(String(matches[0].priceEgp))} ج.م. `
+        : `${matches[0].nameEn} is ${Number(matches[0].priceEgp).toLocaleString("en-US")} EGP. `
+      : "";
+
+  const objectionLead =
+    nextKey === "budget"
+      ? ar
+        ? "مفهوم — السعر في الكتالوج هو سعر الورشة، بس خلينا نسجل ميزانيتك عشان المختص يشوف البدائل المتاحة. "
+        : "I understand — the catalog price is the workshop price, but let me note your budget so a specialist can look at the options available. "
+      : "";
+
   const scripted =
     nextKey === "confirm"
       ? `${lead}${recap(conv, order)}${skippedNote}\n\n${question}`
-      : `${lead}${question}`;
+      : `${lead}${quote}${objectionLead}${question}`;
 
   /* The model answers whatever the customer actually asked and then asks the
      sheet's next question; if it is unavailable the scripted text still ships. */
-  const body = (await composeReply(conv, order, slot, question, scripted)) ?? scripted;
+  const body = (await composeReply(conv, order, slot, question, scripted, matches, photo)) ?? scripted;
 
-  return { reply: reply(body, agent.key), qualification: qualify(conv), order };
+  const message = reply(body, agent.key);
+  if (photo?.imageUrl) {
+    message.imageUrl = photo.imageUrl;
+    message.imageName = ar ? photo.nameAr : photo.nameEn;
+  }
+
+  return { reply: message, qualification: qualify(conv), order };
 }

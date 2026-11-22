@@ -178,6 +178,14 @@ export default function Inbox({ db, t, lang, actions, activeId, meta, role }: Pr
                                 : "border border-glass/20 bg-glass-soft text-glass"
                           }`}
                         >
+                          {m.imageUrl && (
+                            <img
+                              src={m.imageUrl}
+                              alt={m.imageName ?? ""}
+                              loading="lazy"
+                              className="mb-1.5 max-h-[260px] w-full max-w-[240px] rounded-md border border-line/60 object-cover"
+                            />
+                          )}
                           {m.text}
                         </div>
                         <div className={`mt-1 flex items-center gap-1 px-0.5 text-[9.5px] uppercase tracking-[0.1em] text-ink-3/70 ${mine ? "justify-end" : "justify-start"}`}>
